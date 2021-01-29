@@ -2590,6 +2590,49 @@ airplay_control_start(int v6enabled)
 
 /* ----------------------------- Event receiver ------------------------------*/
 
+static int
+events_command_parse(uint8_t *body, size_t body_len)
+{
+  int ret;
+  plist_t request;
+  plist_t item;
+  char *type = NULL;
+  char *value = NULL;
+
+  ret = wplist_from_bin(&request, body, body_len);
+  if (ret < 0)
+    {
+      DPRINTF(E_WARN, L_AIRPLAY, "Could not parse incoming event\n");
+      return -1;
+    }
+
+  item = plist_dict_get_item(request, "type");
+  if (item)
+    {
+      plist_get_string_val(item, &type);
+    }
+
+  item = plist_dict_get_item(request, "value");
+  if (item)
+    {
+      plist_get_string_val(item, &value);
+    }
+
+  DPRINTF(E_INFO, L_AIRPLAY, "Received event type '%s', value '%s'\n", type, value);
+
+  free(type);
+  free(value);
+
+  char *xml = NULL;
+  uint32_t xml_len;
+  plist_to_xml(request, &xml, &xml_len);
+  DPRINTF(E_DBG, L_AIRPLAY, "%s\n", xml);
+
+  plist_free(request);
+
+  return 0;
+}
+
 // TODO actually handle events...
 static void
 event_channel_cb(int fd, short what, void *arg)
@@ -2600,6 +2643,9 @@ event_channel_cb(int fd, short what, void *arg)
   uint8_t in[4096]; //TODO
   uint8_t *out;
   size_t out_len = 0;
+  const char *plist_header = "bplist";
+  size_t plist_header_len = strlen(plist_header);
+  uint8_t *body;
 
   in_len = recv(fd, in, sizeof(in), 0);
   if (in_len < 0)
@@ -2620,7 +2666,18 @@ event_channel_cb(int fd, short what, void *arg)
       return;
     }
 
+  for (body = out; body + plist_header_len < out + out_len; body++)
+    {
+      if (memcmp(body, plist_header, plist_header_len) == 0)
+	{
+	  events_command_parse(body, out_len - (body - out));
+	  break;
+	}
+    }
+
+#if AIRPLAY_DUMP_TRAFFIC
   DHEXDUMP(E_DBG, L_AIRPLAY, out, out_len, "Decrypted incoming event\n");
+#endif
 }
 
 

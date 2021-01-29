@@ -50,6 +50,20 @@ wplist_to_bin(uint8_t **data, size_t *len, plist_t node)
 }
 
 static int
+wplist_from_bin(plist_t *node, uint8_t *data, size_t len)
+{
+  plist_t out = NULL;
+
+  plist_from_bin((char *)data, (uint32_t)len, &out);
+  if (!out)
+    return -1;
+
+  *node = out;
+
+  return 0;
+}
+
+static int
 wplist_from_evbuf(plist_t *node, struct evbuffer *evbuf)
 {
   uint8_t *data = evbuffer_pullup(evbuf, -1);
