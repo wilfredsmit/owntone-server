@@ -2590,6 +2590,22 @@ airplay_control_start(int v6enabled)
 
 /* ----------------------------- Event receiver ------------------------------*/
 
+static void
+playpause(void)
+{
+  struct player_status status;
+
+  player_get_status(&status);
+  if (status.status == PLAY_PLAYING)
+    {
+      player_playback_pause();
+    }
+  else
+    {
+      player_playback_start();
+    }
+}
+
 static int
 events_command_parse(uint8_t *body, size_t body_len)
 {
@@ -2620,6 +2636,9 @@ events_command_parse(uint8_t *body, size_t body_len)
 
   DPRINTF(E_INFO, L_AIRPLAY, "Received event type '%s', value '%s'\n", type, value);
 
+  if (strcmp(type, "sendMediaRemoteCommand") == 0 && strcmp(value, "paus") == 0)
+    playpause();
+
   free(type);
   free(value);
 
@@ -2644,6 +2663,7 @@ event_channel_cb(int fd, short what, void *arg)
   uint8_t *out;
   size_t out_len = 0;
   const char *plist_header = "bplist";
+  const char *rtsp_response_ok = "RTSP/1.0 200 OK\r\nServer: forked-daapd/27.2\r\n\r\n";
   size_t plist_header_len = strlen(plist_header);
   uint8_t *body;
 
@@ -2659,6 +2679,7 @@ event_channel_cb(int fd, short what, void *arg)
   if (in_len == sizeof(in))
     return; // Longer than expected, give up
 
+  // TODO handling of incomplete messages
   ret = pair_decrypt(&out, &out_len, in, in_len, rs->events_cipher_ctx);
   if (ret < 0)
     {
@@ -2678,6 +2699,25 @@ event_channel_cb(int fd, short what, void *arg)
 #if AIRPLAY_DUMP_TRAFFIC
   DHEXDUMP(E_DBG, L_AIRPLAY, out, out_len, "Decrypted incoming event\n");
 #endif
+
+  free(out);
+
+  DHEXDUMP(E_DBG, L_AIRPLAY, (unsigned char *)rtsp_response_ok, strlen(rtsp_response_ok), "Encrypting event ack\n");
+
+  ret = pair_encrypt(&out, &out_len, (unsigned char *)rtsp_response_ok, strlen(rtsp_response_ok), rs->events_cipher_ctx);
+  if (ret < 0)
+    {
+      DPRINTF(E_DBG, L_AIRPLAY, "Error encrypting event ack to '%s', error was: %s\n", rs->devname, pair_cipher_errmsg(rs->events_cipher_ctx));
+      return;
+    }
+
+  ret = send(fd, out, out_len, 0);
+  if (ret < 0)
+    {
+      DPRINTF(E_WARN, L_AIRPLAY, "Event channel ack to '%s' returned an error: %s\n", rs->devname, strerror(errno));
+    }
+
+  free(out);
 }
 
 
