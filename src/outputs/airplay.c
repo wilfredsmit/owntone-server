@@ -47,6 +47,7 @@
 #include "mdns.h"
 #include "misc.h"
 #include "player.h"
+#include "worker.h"
 #include "db.h"
 #include "artwork.h"
 #include "dmap_common.h"
@@ -2590,8 +2591,9 @@ airplay_control_start(int v6enabled)
 
 /* ----------------------------- Event receiver ------------------------------*/
 
+// Thread: worker
 static void
-playpause(void)
+playpause_cb(void *arg)
 {
   struct player_status status;
 
@@ -2636,8 +2638,8 @@ events_command_parse(uint8_t *body, size_t body_len)
 
   DPRINTF(E_INFO, L_AIRPLAY, "Received event type '%s', value '%s'\n", type, value);
 
-  if (strcmp(type, "sendMediaRemoteCommand") == 0 && strcmp(value, "paus") == 0)
-    playpause();
+  if (strcmp(type, "sendMediaRemoteCommand") == 0 && (strcmp(value, "paus") == 0 || strcmp(value, "play") == 0))
+    worker_execute(playpause_cb, NULL, 0, 0);
 
   free(type);
   free(value);
