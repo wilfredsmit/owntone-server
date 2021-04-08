@@ -23,13 +23,19 @@ struct sp_credentials
   size_t token_len;
 };
 
+struct sp_metadata
+{
+  size_t len; // Length of file
+};
+
 struct sp_callbacks
 {
   void (*logged_in)(struct sp_session *session, void *cb_arg, struct sp_credentials *credentials);
   void (*logged_out)(void *cb_arg);
-  void (*track_opened)(struct sp_session *session, void *cb_arg, int fd);
+  void (*track_opened)(struct sp_session *session, void *cb_arg, struct sp_metadata *metadata, int fd);
   void (*track_closed)(struct sp_session *session, void *cb_arg, int fd);
   void (*track_seeked)(struct sp_session *session, void *cb_arg, int fd);
+  void (*progress)(struct sp_session *session, void *cb_arg, size_t received, size_t offset, size_t len);
   void (*error)(void *cb_arg, int err, const char *errmsg);
 
   // Bring your own https client and tcp connector
@@ -68,7 +74,7 @@ int
 spotifyc_play(int fd);
 
 int
-spotifyc_seek(int seek_ms, int fd);
+spotifyc_seek(size_t pos, int fd);
 
 int
 spotifyc_stop(int fd);

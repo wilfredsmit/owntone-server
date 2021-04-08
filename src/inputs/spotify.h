@@ -8,6 +8,7 @@ struct spotify_status
   bool installed;
   bool logged_in;
   bool track_opened;
+  size_t track_len;
   char username[100];
 };
 

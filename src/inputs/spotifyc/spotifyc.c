@@ -38,7 +38,8 @@
  - seek
  - don't memleak e.g. track
  - protect against DOS
- - identify as forked-daapd
+ - limit track download speed
+ - use correct user-agent etc
  - web api token (scope streaming)
  - shutdown not working if msg_send hangs (httpd waiting for player/input)
 */
@@ -56,7 +57,7 @@
 // though this implenentation currently expects just one.
 #define SP_MERCURY_MAX_PARTS 32
 
-  // librespot-golang uses /4 ... not sure what that means?
+// librespot-golang uses /4 ... not sure what that means?
 #define SP_MERCURY_ENDPOINT "hm://metadata/3/track/"
 
 // Special Spotify header that comes before the actual Ogg data
@@ -65,6 +66,7 @@
 // For now we just always use channel 0, expand with more if needed
 #define SP_DEFAULT_CHANNEL 0
 
+// Download in chunks of 65536 bytes
 #define SP_CHUNK_LEN_WORDS 1024 * 16
 
 // Shorthand for error handling
@@ -142,7 +144,7 @@ struct sp_cmdargs {
   char *path;
   int fd_read;
   int fd_write;
-  int seek_ms;
+  size_t seek_pos;
   enum sp_bitrates bitrate;
 };
 
@@ -237,6 +239,20 @@ struct sp_file
   struct crypto_aes_cipher decrypt;
 };
 
+struct sp_channel_header
+{
+  uint16_t len;
+  uint8_t id;
+  uint8_t *data;
+  size_t data_len;
+};
+
+struct sp_channel_body
+{
+  uint8_t *data;
+  size_t data_len;
+};
+
 struct sp_channel
 {
   int id;
@@ -244,20 +260,25 @@ struct sp_channel
   bool data_mode;
   bool spotify_header_received;
   bool in_use;
+  bool play_requested;
   bool stop_requested;
+  bool seek_requested;
+  size_t seek_pos;
 
   // pipe where we write audio data
   int audio_fd[2];
+  // Triggers when fd is writable
+  struct event *audio_write_ev;
+  // Storage of audio until it can be written to the pipe
+  struct evbuffer *audio_buf;
+  // How much we have written to the fd (only used for debug)
+  size_t audio_written_len;
 
   struct sp_file file;
-};
 
-struct sp_channel_header
-{
-  uint16_t len;
-  uint8_t id;
-  uint8_t *data;
-  size_t data_len;
+  // Latest header and body received
+  struct sp_channel_header header;
+  struct sp_channel_body body;
 };
 
 // Linked list of sessions
@@ -772,6 +793,72 @@ crypto_aes_decrypt(uint8_t *encrypted, size_t encrypted_len, struct crypto_aes_c
 }
 
 
+/* --------------------------------- Helpers -------------------------------- */
+
+static unsigned char
+base62_digit(char c)
+{
+  if (isdigit(c))
+    return c - '0';
+  else if (islower(c))
+    return c - 'a' + 10;
+  else if (isupper(c))
+    return c - 'A' + 10 + 26;
+  else
+    return 0xff;
+}
+
+// base 62 to bin: 4gtj0ZuMWRw8WioT9SXsC2 -> 8c283882b29346829b8d021f52f5c2ce
+//                 00AdHZ94Jb7oVdHVJmJsIU -> 004f421c7e934635aaf778180a8fd068
+static int
+path_to_track_id(struct sp_file *file)
+{
+  uint8_t u8;
+  bnum n;
+  bnum base;
+  bnum digit;
+  char *ptr;
+  int ret;
+
+  u8 = 62;
+  bnum_bin2bn(base, &u8, sizeof(u8));
+  bnum_new(n);
+
+  ptr = strrchr(file->track_path, ':');
+  if (!ptr || strlen(ptr + 1) != 22)
+    RETURN_ERROR(SP_INVALID, "Spotify track ID had unexpected length");
+
+  for (ptr += 1; *ptr; ptr++)
+    {
+      // n = 62 * n + base62_digit(*p);
+      bnum_mul(n, n, base);
+      u8 = base62_digit(*ptr);
+
+      // Heavy on alloc's, but means we can use bnum compability wrapper
+      bnum_bin2bn(digit, &u8, sizeof(u8));
+      bnum_add(n, n, digit);
+      bnum_free(digit);
+    }
+
+  ret = bnum_num_bytes(n);
+  if (ret > sizeof(file->track_id))
+    RETURN_ERROR(SP_INVALID, "Invalid Spotify track ID");
+
+  memset(file->track_id, 0, sizeof(file->track_id) - ret);
+  bnum_bn2bin(n, file->track_id + sizeof(file->track_id) - ret, ret);
+
+  sp_cb.hexdump("file->track_id\n", file->track_id, sizeof(file->track_id));
+
+  bnum_free(n);
+  bnum_free(base);
+
+  return 0;
+
+ error:
+  return ret;
+}
+
+
 /* --------------------------- Connection handling -------------------------- */
 
 static int
@@ -1079,16 +1166,38 @@ Here is my current understanding of the channel concept:
 6. The channel can presumably be reset with CmdChannelAbort (?)
 */
 
-static int
-channel_id_check(uint32_t channel_id, struct sp_session *session)
+static struct sp_channel *
+channel_get(uint32_t channel_id, struct sp_session *session)
 {
   if (channel_id > sizeof(session->channels)/sizeof(session->channels)[0])
-    return -1;
+    return NULL;
 
   if (!session->channels[channel_id].in_use)
-    return -1;
+    return NULL;
 
-  return 0;
+  return &session->channels[channel_id];
+}
+
+static void
+channel_write_cb(int fd, short what, void *arg)
+{
+  struct sp_channel *channel = arg;
+  ssize_t wrote;
+
+  wrote = evbuffer_write(channel->audio_buf, channel->audio_fd[1]);
+  if (wrote < 0)
+    {
+      sp_cb.logmsg("Error writing to audio pipe");
+      event_del(channel->audio_write_ev);
+      channel->stop_requested = true;
+    }
+
+  assert (wrote > 0); // TODO
+
+  channel->audio_written_len += wrote;
+
+  if (evbuffer_get_length(channel->audio_buf) > 0)
+    event_add(channel->audio_write_ev, 0);
 }
 
 static void
@@ -1100,20 +1209,46 @@ channel_reset(struct sp_channel *channel)
   if (channel->audio_fd[1] >= 0)
     close(channel->audio_fd[1]);
 
+  if (channel->audio_buf)
+    evbuffer_free(channel->audio_buf);
+
+  if (channel->audio_write_ev)
+    event_free(channel->audio_write_ev);
+
+  free(channel->file.track_path);
+
   memset(channel, 0, sizeof(struct sp_channel));
+
+  channel->audio_fd[0] = -1;
+  channel->audio_fd[1] = -1;
 }
 
 static int
-channel_begin(struct sp_channel **channel, struct sp_session *session)
+channel_begin(struct sp_channel **new_channel, struct sp_session *session, char *path, int fd_read, int fd_write)
 {
+  struct sp_channel *channel;
   uint16_t i = SP_DEFAULT_CHANNEL;
 
-  channel_reset(&session->channels[i]);
-  session->channels[i].id = i;
-  session->channels[i].in_use = true;
-  session->channels[i].audio_fd[1] = -1;
+  channel = &session->channels[i];
 
-  *channel = &session->channels[i];
+  channel_reset(channel);
+  channel->id = i;
+  channel->in_use = true;
+
+  channel->file.track_path = path;
+  path_to_track_id(&channel->file); // Sets file->track_id from file->path
+
+  // Set up the audio I/O
+  channel->audio_fd[0] = fd_read;
+  channel->audio_fd[1] = fd_write;
+
+  channel->audio_write_ev = event_new(sp_evbase, channel->audio_fd[1], EV_WRITE, channel_write_cb, channel);
+  if (!channel->audio_write_ev)
+    return -1;
+
+  channel->audio_buf = evbuffer_new();
+
+  *new_channel = channel;
 
   return 0;
 }
@@ -1180,10 +1315,8 @@ channel_header_handle(struct sp_channel *channel, struct sp_channel_header *head
 }
 
 static ssize_t
-channel_header_trailer_read(uint16_t channel_id, uint8_t *msg, size_t msg_len, struct sp_session *session)
+channel_header_trailer_read(struct sp_channel *channel, uint8_t *msg, size_t msg_len, struct sp_session *session)
 {
-  struct sp_channel *channel = &session->channels[channel_id];
-  struct sp_channel_header header;
   ssize_t parsed_len;
   ssize_t consumed_len;
   int ret;
@@ -1203,19 +1336,19 @@ channel_header_trailer_read(uint16_t channel_id, uint8_t *msg, size_t msg_len, s
 
   for (consumed_len = 0; msg_len > 0; msg += parsed_len, msg_len -= parsed_len)
     {
-      parsed_len = channel_header_parse(&header, msg, msg_len);
+      parsed_len = channel_header_parse(&channel->header, msg, msg_len);
       if (parsed_len < 0)
 	RETURN_ERROR(SP_INVALID, "Invalid channel header");
 
       consumed_len += parsed_len;
 
-      if (header.len == 0)
+      if (channel->header.len == 0)
 	{
 	  channel->data_mode = true;
 	  break; // All headers read
 	}
 
-      channel_header_handle(channel, &header);
+      channel_header_handle(channel, &channel->header);
     }
 
   return consumed_len;
@@ -1225,11 +1358,9 @@ channel_header_trailer_read(uint16_t channel_id, uint8_t *msg, size_t msg_len, s
 }
 
 static ssize_t
-channel_data_read(uint16_t channel_id, uint8_t *msg, size_t msg_len, struct sp_session *session)
+channel_data_read(struct sp_channel *channel, uint8_t *msg, size_t msg_len, struct sp_session *session)
 {
-  struct sp_channel *channel = &session->channels[channel_id];
   const char *errmsg;
-  ssize_t wrote;
   int ret;
 
   assert (msg_len % 4 == 0);
@@ -1252,13 +1383,8 @@ channel_data_read(uint16_t channel_id, uint8_t *msg, size_t msg_len, struct sp_s
       msg_len -= SP_OGG_HEADER_LEN;
     }
 
-  if (channel->stop_requested)
-    return 0;
-
-  wrote = write(channel->audio_fd[1], msg, msg_len);
-
-  if (wrote != msg_len)
-    RETURN_ERROR(SP_WRITE, "Could not write to output");
+  channel->body.data = msg;
+  channel->body.data_len = msg_len;
 
   return 0;
 
@@ -1269,6 +1395,7 @@ channel_data_read(uint16_t channel_id, uint8_t *msg, size_t msg_len, struct sp_s
 static int
 channel_msg_read(uint16_t *channel_id, uint8_t *msg, size_t msg_len, struct sp_session *session)
 {
+  struct sp_channel *channel;
   uint16_t be;
   ssize_t consumed_len;
   int ret;
@@ -1279,8 +1406,8 @@ channel_msg_read(uint16_t *channel_id, uint8_t *msg, size_t msg_len, struct sp_s
   memcpy(&be, msg, sizeof(be));
   *channel_id = be16toh(be);
 
-  ret = channel_id_check(*channel_id, session);
-  if (ret < 0)
+  channel = channel_get(*channel_id, session);
+  if (!channel)
     {
       sp_cb.hexdump("Message with unknown channel\n", msg, msg_len);
       RETURN_ERROR(SP_INVALID, "Could not recognize channel in chunk response");
@@ -1290,17 +1417,20 @@ channel_msg_read(uint16_t *channel_id, uint8_t *msg, size_t msg_len, struct sp_s
   msg_len -= sizeof(be);
 
   // Will set data_mode, end_of_file and end_of_chunk as appropriate
-  consumed_len = channel_header_trailer_read(*channel_id, msg, msg_len, session);
+  consumed_len = channel_header_trailer_read(channel, msg, msg_len, session);
   if (consumed_len < 0)
     RETURN_ERROR((int)consumed_len, sp_errmsg);
 
   msg += consumed_len;
   msg_len -= consumed_len;
 
-  if (!session->channels[*channel_id].data_mode || !(msg_len > 0))
+  channel->body.data = NULL;
+  channel->body.data_len = 0;
+
+  if (!channel->data_mode || !(msg_len > 0))
     return 0; // Not in data mode or no data to read
 
-  consumed_len = channel_data_read(*channel_id, msg, msg_len, session);
+  consumed_len = channel_data_read(channel, msg, msg_len, session);
   if (consumed_len < 0)
     RETURN_ERROR((int)consumed_len, sp_errmsg);
 
@@ -1653,14 +1783,28 @@ static int
 response_chunk_res(uint8_t *payload, size_t payload_len, struct sp_session *session)
 {
   struct sp_channel *channel;
+  struct sp_metadata metadata = { 0 };
   uint16_t channel_id;
   int ret;
 
   ret = channel_msg_read(&channel_id, payload, payload_len, session);
   if (ret < 0)
-    return ret;
+    goto error;
 
   channel = &session->channels[channel_id];
+
+  // Handle the parsed message, first save the audio data to a buffer that will
+  // be written to audio_fd[1] when it is writable
+  if (channel->stop_requested || channel->seek_requested)
+    {
+      evbuffer_drain(channel->audio_buf, -1);
+      event_del(channel->audio_write_ev);
+    }
+  else if (channel->body.data > 0)
+    {
+      evbuffer_add(channel->audio_buf, channel->body.data, channel->body.data_len);
+      event_add(channel->audio_write_ev, 0);
+    }
 
   if (channel->file.end_of_file || (channel->stop_requested && channel->file.end_of_chunk))
     {
@@ -1671,13 +1815,33 @@ response_chunk_res(uint8_t *payload, size_t payload_len, struct sp_session *sess
     }
   else if (channel->file.end_of_chunk)
     {
-      // Will make msg_receive -> msg_next_cb trigger request for a new chunk
       channel->file.offset_words += SP_CHUNK_LEN_WORDS;
       channel->file.end_of_chunk = false;
-      session->msg_type_next = MSG_TYPE_CHUNK_REQUEST;
+
+      if (channel->play_requested)
+	{
+	  // Will make msg_receive -> msg_next_cb trigger request for a new chunk
+          session->msg_type_next = MSG_TYPE_CHUNK_REQUEST;
+	  if (sp_cb.progress)
+	    sp_cb.progress(session, sp_cb_arg, 4 * channel->file.received_words, 4 * channel->file.offset_words, 4 * channel->file.len_words);
+        }
+      else
+	{
+	  metadata.len = 4 * channel->file.len_words;
+	  if (sp_cb.track_opened)
+	    sp_cb.track_opened(session, sp_cb_arg, &metadata, channel->audio_fd[0]);
+	}
+    }
+  else
+    {
+      // More data from Spotify expected
+      event_add(session->conn.timeout_ev, &sp_timeout_tv);
     }
 
   return 1;
+
+ error:
+  return ret;
 }
 
 static int
@@ -1696,21 +1860,15 @@ response_aes_key(uint8_t *payload, size_t payload_len, struct sp_session *sessio
   memcpy(&be32, payload, sizeof(be32));
   channel_id = be32toh(be32);
 
-  ret = channel_id_check(channel_id, session);
-  if (ret < 0)
+  channel = channel_get(channel_id, session);
+  if (!channel)
     RETURN_ERROR(SP_INVALID, "Unexpected channel received");
-
-  channel = &session->channels[channel_id];
 
   memcpy(channel->file.track_key, payload + 4, 16);
 
   ret = crypto_aes_new(&channel->file.decrypt, channel->file.track_key, sizeof(channel->file.track_key), sp_aes_iv, sizeof(sp_aes_iv), &errmsg);
   if (ret < 0)
     RETURN_ERROR(SP_DECRYPTION, errmsg);
-
-  // Caller reads from audio_fd[0]
-  if (sp_cb.track_opened)
-    sp_cb.track_opened(session, sp_cb_arg, channel->audio_fd[0]);
 
   return 1;
 
@@ -1746,11 +1904,9 @@ response_mercury_req(uint8_t *payload, size_t payload_len, struct sp_session *se
 
   channel_id = (uint32_t)mercury.seq;
 
-  ret = channel_id_check(channel_id, session);
-  if (ret < 0)
+  channel = channel_get(channel_id, session);
+  if (!channel)
     RETURN_ERROR(SP_INVALID, "Unexpected channel received");
-
-  channel = &session->channels[channel_id];
 
   channel->file.track = mercury.parts[0].track;
 
@@ -1953,6 +2109,7 @@ msg_receive(int fd, short what, void *arg)
       else
 	sp_cb.hexdump("Received message (truncated)\n", msg, 128);
 
+      // Note msg-handler may re-add the event if more data is expected
       event_del(conn->timeout_ev);
 
       ret = session->msg_handler(msg, msg_len, session);
@@ -2276,6 +2433,20 @@ msg_make_chunk_request(uint8_t *out, size_t out_len, struct sp_session *session)
   uint16_t be;
   uint32_t be32;
   size_t required_len;
+  uint32_t seek_words;
+
+  if (channel->seek_requested)
+    {
+      seek_words = channel->seek_pos / 4;
+      if (seek_words > channel->file.len_words)
+	return -1;
+
+      // Set the offset and received counter to match the seek
+      channel->file.offset_words = seek_words;
+      channel->file.received_words = seek_words;
+      channel->seek_pos = 0;
+      channel->seek_requested = false;
+    }
 
   ptr = out;
 
@@ -2365,6 +2536,7 @@ msg_make(enum sp_cmd_type *outcmd, uint8_t *out, size_t out_len, enum sp_msg_typ
 	msg_len = msg_make_audio_key_get(out, out_len, session);
 	cmd = CmdRequestKey;
 	session->msg_handler = response_generic;
+	session->msg_type_next = MSG_TYPE_CHUNK_REQUEST;
 	break;
       case MSG_TYPE_CHUNK_REQUEST:
 	msg_len = msg_make_chunk_request(out, out_len, session);
@@ -2449,73 +2621,13 @@ msg_send(enum sp_msg_type type, struct sp_session *session)
 
 /* ----------------------------- Implementation ----------------------------- */
 
-static unsigned char
-base62_digit(char c)
-{
-  if (isdigit(c))
-    return c - '0';
-  else if (islower(c))
-    return c - 'a' + 10;
-  else if (isupper(c))
-    return c - 'A' + 10 + 26;
-  else
-    return 0xff;
-}
-
-// base 62 to bin: 4gtj0ZuMWRw8WioT9SXsC2 -> 8c283882b29346829b8d021f52f5c2ce
-//                 00AdHZ94Jb7oVdHVJmJsIU -> 004f421c7e934635aaf778180a8fd068
-static int
-path_to_track_id(struct sp_file *file)
-{
-  uint8_t u8;
-  bnum n;
-  bnum base;
-  bnum digit;
-  char *ptr;
-  int ret;
-
-  u8 = 62;
-  bnum_bin2bn(base, &u8, sizeof(u8));
-  bnum_new(n);
-
-  ptr = strrchr(file->track_path, ':');
-  if (!ptr || strlen(ptr + 1) != 22)
-    RETURN_ERROR(SP_INVALID, "Spotify track ID had unexpected length");
-
-  for (ptr += 1; *ptr; ptr++)
-    {
-      // n = 62 * n + base62_digit(*p);
-      bnum_mul(n, n, base);
-      u8 = base62_digit(*ptr);
-
-      // Heavy on alloc's, but means we can use bnum compability wrapper
-      bnum_bin2bn(digit, &u8, sizeof(u8));
-      bnum_add(n, n, digit);
-      bnum_free(digit);
-    }
-
-  ret = bnum_num_bytes(n);
-  if (ret > sizeof(file->track_id))
-    RETURN_ERROR(SP_INVALID, "Invalid Spotify track ID");
-
-  memset(file->track_id, 0, sizeof(file->track_id) - ret);
-  bnum_bn2bin(n, file->track_id + sizeof(file->track_id) - ret, ret);
-
-  sp_cb.hexdump("file->track_id\n", file->track_id, sizeof(file->track_id));
-
-  bnum_free(n);
-  bnum_free(base);
-
-  return 0;
-
- error:
-  return ret;
-}
-
 static int
 track_play(struct sp_session *session, struct sp_cmdargs *cmdargs)
 {
+  struct sp_channel *channel = session->now_streaming_channel;
   int ret;
+
+  channel->play_requested = true;
 
   ret = msg_send(MSG_TYPE_CHUNK_REQUEST, session);
   if (ret < 0)
@@ -2527,10 +2639,25 @@ track_play(struct sp_session *session, struct sp_cmdargs *cmdargs)
   return ret;
 }
 
+// This only implements file seek, since Ogg page seek would require decoding
 static int
 track_seek(struct sp_session *session, struct sp_cmdargs *cmdargs)
 {
-  return SP_INVALID;
+  struct sp_channel *channel = session->now_streaming_channel;
+  int ret;
+
+  if (!channel || !channel->in_use)
+    RETURN_ERROR(SP_INVALID, "Cannot seek, not playing any track");
+
+  // The actual seeking is done by the chunk requestor, which will also make the
+  // callback
+  channel->seek_pos = cmdargs->seek_pos;
+  channel->seek_requested = true;
+
+  return 0;
+
+ error:
+  return ret;
 }
 
 static int
@@ -2543,6 +2670,17 @@ track_stop(struct sp_session *session, struct sp_cmdargs *cmdargs)
 
   // Prevents further chunk requests
   channel->stop_requested = true;
+
+  // FIXME This is an attempt to make sure a callback is made if stop is called
+  // before playback is started (i.e. we can't stop in the chunk receiver). But
+  // there might still be situations where that can happen.
+  if (!channel->play_requested)
+    {
+      if (sp_cb.track_closed)
+	sp_cb.track_closed(session, sp_cb_arg, channel->audio_fd[0]);
+      session->now_streaming_channel = NULL;
+      channel_reset(channel);
+    }
 
   return 0;
 }
@@ -2560,22 +2698,16 @@ track_open(struct sp_session *session, struct sp_cmdargs *cmdargs)
     }
 
   // Reserve a channel for the upcoming communication
-  ret = channel_begin(&channel, session);
+  ret = channel_begin(&channel, session, cmdargs->path, cmdargs->fd_read, cmdargs->fd_write);
   if (ret < 0)
     RETURN_ERROR(SP_OOM, "Could not reserve a channel");
 
   // Must be set before calling msg_send() because this info is needed for
   // making the request
   session->now_streaming_channel = channel;
-  channel->file.track_path = cmdargs->path;
 
-  channel->audio_fd[0] = cmdargs->fd_read;
-  channel->audio_fd[1] = cmdargs->fd_write;
-
-  // Sets file->track_id from file->path
-  path_to_track_id(&channel->file);
-
-  // Kicks of a sequence where we first get file info and then get the AES key
+  // Kicks of a sequence where we first get file info, then get the AES key and
+  // then the first chunk (incl. headers)
   ret = msg_send(MSG_TYPE_MERCURY_TRACK_GET, session);
   if (ret < 0)
     RETURN_ERROR(SP_NOCONNECTION, "Could not send track request");
@@ -2713,12 +2845,10 @@ spotifyc_open(const char *path, struct sp_session *session)
 {
   struct sp_cmdargs *cmdargs;
   int fd[2];
-  int ret;
 
   // Open the fd's right away so we can return the fd to caller. Caller will own
-  // the reading end, audio_fd[0]
-  ret = pipe(fd);
-  if (ret < 0)
+  // the reading end, audio_fd[0].
+  if ( pipe(fd) < 0 || fcntl(fd[0], F_SETFL, O_CLOEXEC ) < 0 || fcntl(fd[1], F_SETFL, O_CLOEXEC ) < 0 )
     return SP_WRITE;
 
   cmdargs = calloc(1, sizeof(struct sp_cmdargs));
@@ -2760,12 +2890,12 @@ spotifyc_play(int fd)
 }
 
 int
-spotifyc_seek(int seek_ms, int fd)
+spotifyc_seek(size_t pos, int fd)
 {
   struct sp_cmdargs *cmdargs = calloc(1, sizeof(struct sp_cmdargs));
 
   cmdargs->fd_read  = fd;
-  cmdargs->seek_ms  = seek_ms;
+  cmdargs->seek_pos = pos;
   cmdargs->handler  = track_seek;
 
   commands_exec_async(sp_cmdbase, command_receive, cmdargs);
